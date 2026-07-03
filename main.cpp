@@ -1,382 +1,404 @@
-#include <Windows.h>
+// QQ 连连看（角色版）自动消除工具
+//
+// 原理：通过 ReadProcessMemory 读取游戏进程内存中的棋盘，按连连看规则
+//       （连接路径不超过两个拐点，且允许绕棋盘外框一圈）计算可连接的同值
+//       方块对，再用 SetCursorPos + mouse_event 模拟点击自动消除。
+//
+// 说明：本工具仅支持 Windows；需以管理员身份运行；源文件为 UTF-8 编码，
+//       MSVC 需带 /utf-8 编译选项（本仓库的 .vcxproj 已配置）。
+
+#ifndef _WIN32
+#error "本工具依赖 ReadProcessMemory / mouse_event / FindWindowW，仅支持 Windows 平台"
+#endif
+
+#include <windows.h>
+
 #include <algorithm>
-
+#include <array>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
-#include <vector>
-#include <memory>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
-// Define Point structure
+// 棋盘坐标点：x = 列，y = 行
 struct Point {
-    int x = 0, y = 0;
+    int x = 0;
+    int y = 0;
     Point(int _x = 0, int _y = 0) : x(_x), y(_y) {}
 };
 
-// Define Block structure
+// 一个方块：值 + 棋盘坐标（value == 0 表示空格）
 struct Block {
     unsigned char value = 0;
     Point point;
 
-    Block(int x = 0, int y = 0) : point(x, y) {}
-    Block(Point p) : point(p) {}
-
-    bool operator==(const Block& other) const {
-        return point.x == other.point.x && point.y == other.point.y;
-    }
+    Block() = default;
+    Block(int x, int y, unsigned char v = 0) : value(v), point(x, y) {}
 };
 
 class Link {
 public:
     Link() = default;
-    ~Link() { if (processHandle) CloseHandle(processHandle); }
+    ~Link() { closeProcess(); }
+
+    Link(const Link&) = delete;
+    Link& operator=(const Link&) = delete;
 
     void run() {
+        std::cout << "F1 开始\nF2 停止" << std::endl;
         while (true) {
             handleKeyInput();
-            if (!isRunning) {
+            if (!isRunning_) {
                 Sleep(100);
                 continue;
             }
-
             if (!initializeGame()) {
                 Sleep(1000);
                 continue;
             }
-
             runGameLoop();
         }
     }
 
 private:
+    // ---- 棋盘几何 ----
+    static constexpr int ROWS = 11;  // 行数
+    static constexpr int COLS = 19;  // 列数
+
+    // ---- 目标进程内存区域（每格 1 字节，0 表示空）----
+    static constexpr uintptr_t START_ADDRESS = 0x199F5C + 4;
+    static constexpr uintptr_t END_ADDRESS = 0x19A02C + 4;
+    static constexpr size_t REGION_SIZE = END_ADDRESS - START_ADDRESS + 1;
+    static_assert(REGION_SIZE == static_cast<size_t>(ROWS) * COLS,
+                  "内存区域大小必须等于 ROWS*COLS");
+
+    // ---- 点击标定参数（相对窗口左上角的像素偏移，随游戏窗口样式而定）----
+    static constexpr int CLICK_ORIGIN_X = 25;
+    static constexpr int CLICK_ORIGIN_Y = 195;
+    static constexpr int CELL_W = 31;
+    static constexpr int CELL_H = 35;
+    static constexpr DWORD CLICK_GAP_MS = 8;  // 每次点击后的短暂延时，避免过快漏点
+
+    // ---- 循环节奏 ----
+    static constexpr DWORD LOOP_DELAY_MS = 50;   // 每轮扫描间隔
+    static constexpr DWORD EMPTY_WAIT_MS = 300;  // 棋盘为空（过关/切换）时的等待
+    static constexpr int NO_MOVE_LIMIT = 3;      // 连续无可消除对达到此值判为死局
+
+    // 带一圈空白外框的占用栅格：真实格 (y,x) 存于 grid_[y+1][x+1]，
+    // 外框（下标 0 与 ROWS+1 / COLS+1）恒为空，用于支持“绕外框一圈”的连接。
+    std::array<std::array<unsigned char, COLS + 2>, ROWS + 2> grid_{};
+
+    // 按值分组的方块坐标，供匹配算法使用
+    std::unordered_map<unsigned char, std::vector<Point>> valueGroups_;
+    std::vector<std::pair<Block, Block>> pairs_;
+
+    HANDLE processHandle_ = nullptr;
+    HWND windowHandle_ = nullptr;
+    bool isRunning_ = false;
+    int noMoveCount_ = 0;
+
+    // ---------- 主循环控制 ----------
     void handleKeyInput() {
-        if (isKeyPressed(VK_F1) && !isRunning) {
-            isRunning = true;
-            std::cout << "Program started, press F2 to pause" << std::endl;
+        if (isKeyPressed(VK_F1) && !isRunning_) {
+            isRunning_ = true;
+            noMoveCount_ = 0;
+            std::cout << "程序已启动，按 F2 暂停" << std::endl;
             Sleep(200);
-        }
-        else if (isKeyPressed(VK_F2) && isRunning) {
-            isRunning = false;
-            std::cout << "Program paused, press F1 to continue" << std::endl;
+        } else if (isKeyPressed(VK_F2) && isRunning_) {
+            isRunning_ = false;
+            std::cout << "程序已暂停，按 F1 继续" << std::endl;
             Sleep(200);
         }
     }
 
     bool initializeGame() {
         if (!readWindow()) {
-            std::cout << "Failed to read process" << std::endl;
+            std::cout << "未找到目标进程" << std::endl;
             return false;
         }
         return true;
     }
 
     void runGameLoop() {
-        while (isRunning) {
+        while (isRunning_) {
             if (isKeyPressed(VK_F2)) {
-                isRunning = false;
-                std::cout << "Program paused, press F1 to continue" << std::endl;
+                isRunning_ = false;
+                std::cout << "程序已暂停，按 F1 继续" << std::endl;
                 Sleep(200);
-                break;
+                return;
             }
 
-            if (!processGameState()) break;
-            Sleep(1);
+            if (!readBoard()) {
+                // 读取失败：游戏多半已关闭/句柄失效，释放并回到外层重新连接
+                std::cout << "读取内存失败，正在重新连接……" << std::endl;
+                closeProcess();
+                windowHandle_ = nullptr;
+                Sleep(500);
+                return;
+            }
+
+            if (valueGroups_.empty()) {
+                // 棋盘为空：过关或界面切换，等待而非拆除循环（避免空转 / 句柄泄漏）
+                Sleep(EMPTY_WAIT_MS);
+                continue;
+            }
+
+            findMatchingPairs();
+
+            if (pairs_.empty()) {
+                // 有方块却找不到任何可连接对：可能是死局（需洗牌）。
+                // 多扫描几轮以排除瞬时状态，仍无解则暂停并提示。
+                if (++noMoveCount_ >= NO_MOVE_LIMIT) {
+                    std::cout << "未找到可消除的方块对（可能需要洗牌），已暂停。按 F1 继续" << std::endl;
+                    isRunning_ = false;
+                    return;
+                }
+                Sleep(EMPTY_WAIT_MS);
+                continue;
+            }
+
+            noMoveCount_ = 0;
+            eliminatePairs();
+            Sleep(LOOP_DELAY_MS);
         }
     }
 
-    bool processGameState() {
-        if (!readBlocksFromProcessMemory()) {
-            std::cout << "Failed to read memory" << std::endl;
-            return true;
+    // ---------- 进程 / 窗口 ----------
+    void closeProcess() {
+        if (processHandle_) {
+            CloseHandle(processHandle_);
+            processHandle_ = nullptr;
         }
-
-        if (blocks_.empty()) return false;
-
-        find_matching_coordinates();
-        eiminationBox();
-        return true;
     }
 
     bool readWindow() {
-        windowHandle = FindWindowW(nullptr, L"QQ��Ϸ - ��������ɫ��");
-        if (!windowHandle) {
-            std::cout << "Target process not found" << std::endl;
+        windowHandle_ = FindWindowW(nullptr, L"QQ游戏 - 连连看角色版");
+        if (!windowHandle_) {
+            std::cout << "未找到目标窗口" << std::endl;
             return false;
         }
 
-        DWORD processId;
-        GetWindowThreadProcessId(windowHandle, &processId);
-        processHandle = OpenProcess(PROCESS_VM_READ, FALSE, processId);
+        DWORD processId = 0;
+        if (GetWindowThreadProcessId(windowHandle_, &processId) == 0 || processId == 0) {
+            std::cout << "无法获取窗口进程 ID" << std::endl;
+            return false;
+        }
 
-        return processHandle != nullptr;
+        closeProcess();  // 关闭上一轮的句柄，避免泄漏
+        processHandle_ = OpenProcess(PROCESS_VM_READ, FALSE, processId);
+        if (!processHandle_) {
+            DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED) {
+                std::cout << "打开进程被拒绝，请以管理员身份运行" << std::endl;
+            } else {
+                std::cout << "打开进程失败，错误码 " << err << std::endl;
+            }
+            return false;
+        }
+        return true;
     }
 
-    // Add new board representation
-    struct GameBoard {
-        static constexpr int ROWS = 11;
-        static constexpr int COLS = 19;
-        std::vector<std::vector<unsigned char>> board;
-        
-        GameBoard() : board(ROWS, std::vector<unsigned char>(COLS, 0)) {}
-        
-        unsigned char& at(int y, int x) { 
-            return board[y][x]; 
-        }
-        
-        bool isValid(int y, int x) const {
-            return y >= 0 && y < ROWS && x >= 0 && x < COLS;
-        }
-        
-        bool isEmpty(int y, int x) const {
-            return board[y][x] == 0;
-        }
-    };
-    
-    GameBoard gameBoard;
+    // ---------- 读取棋盘 ----------
+    bool readBoard() {
+        if (!processHandle_) return false;
 
-    // Optimized matching algorithm
-    void find_matching_coordinates() {
-        blockspair_.clear();
-        
-        // Sort blocks by value for faster matching
-        std::unordered_map<unsigned char, std::vector<Point>> valueMap;
-        for (const auto& block : blocks_) {
-            valueMap[block.value].push_back(block.point);
+        std::array<unsigned char, REGION_SIZE> buffer{};
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(processHandle_,
+                               reinterpret_cast<LPCVOID>(START_ADDRESS),
+                               buffer.data(), REGION_SIZE, &bytesRead) ||
+            bytesRead != REGION_SIZE) {
+            return false;
         }
 
-        // Process each value group
-        for (const auto& [value, points] : valueMap) {
-            findBestMatches(points);
+        // 每轮都从内存重建栅格与分组（写入 0 以清除已消除的格子）
+        for (auto& row : grid_) row.fill(0);
+        valueGroups_.clear();
+
+        for (int y = 0; y < ROWS; ++y) {
+            for (int x = 0; x < COLS; ++x) {
+                unsigned char value = buffer[static_cast<size_t>(y) * COLS + x];
+                setCell(y, x, value);
+                if (value != 0) {
+                    valueGroups_[value].emplace_back(x, y);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ---------- 占用栅格访问（含外框）----------
+    void setCell(int y, int x, unsigned char v) { grid_[y + 1][x + 1] = v; }
+
+    // 允许查询 [-1, ROWS] × [-1, COLS]（含外框一圈）；范围外视为非空
+    bool isEmpty(int y, int x) const {
+        if (y < -1 || y > ROWS || x < -1 || x > COLS) return false;
+        return grid_[y + 1][x + 1] == 0;
+    }
+
+    // ---------- 匹配算法 ----------
+    void findMatchingPairs() {
+        pairs_.clear();
+        for (const auto& [value, points] : valueGroups_) {
+            matchGroup(value, points);
         }
     }
 
-    // Find optimal matches for a group of same-value points
-    void findBestMatches(const std::vector<Point>& points) {
+    // 对同值方块做贪心匹配：优先拐点少、曼哈顿距离短的连接
+    void matchGroup(unsigned char value, const std::vector<Point>& points) {
         std::vector<bool> matched(points.size(), false);
-        
-        // Process points from left to right and top to bottom
-        for (size_t i = 0; i < points.size(); i++) {
+
+        for (size_t i = 0; i < points.size(); ++i) {
             if (matched[i]) continue;
-            
-            // Find the best match for current point
-            int bestMatchIndex = -1;
-            int minTurns = 3;  // Maximum possible turns
-            int minDistance = INT_MAX;
-            
-            for (size_t j = i + 1; j < points.size(); j++) {
+
+            int bestIndex = -1;
+            int bestTurns = 3;  // 合法连接最多 2 拐点，3 作哨兵
+            int bestDistance = INT_MAX;
+
+            for (size_t j = i + 1; j < points.size(); ++j) {
                 if (matched[j]) continue;
-                
-                int turns;
+
+                int turns = 0;
                 if (canConnect(points[i], points[j], turns)) {
-                    int distance = calculateDistance(points[i], points[j]);
-                    // Prefer matches with fewer turns and shorter distance
-                    if (turns < minTurns || (turns == minTurns && distance < minDistance)) {
-                        minTurns = turns;
-                        minDistance = distance;
-                        bestMatchIndex = j;
+                    int distance = manhattan(points[i], points[j]);
+                    if (turns < bestTurns ||
+                        (turns == bestTurns && distance < bestDistance)) {
+                        bestTurns = turns;
+                        bestDistance = distance;
+                        bestIndex = static_cast<int>(j);
                     }
                 }
             }
-            
-            // Add the best match if found
-            if (bestMatchIndex != -1) {
-                Block b1(points[i].x, points[i].y);
-                Block b2(points[bestMatchIndex].x, points[bestMatchIndex].y);
-                b1.value = b2.value = gameBoard.at(points[i].y, points[i].x);
-                blockspair_.emplace_back(b1, b2);
-                matched[i] = matched[bestMatchIndex] = true;
+
+            if (bestIndex != -1) {
+                Block a(points[i].x, points[i].y, value);
+                Block b(points[bestIndex].x, points[bestIndex].y, value);
+                pairs_.emplace_back(a, b);
+                matched[i] = true;
+                matched[static_cast<size_t>(bestIndex)] = true;
             }
         }
     }
 
-    // Calculate Manhattan distance between two points
-    int calculateDistance(const Point& p1, const Point& p2) {
+    static int manhattan(const Point& p1, const Point& p2) {
         return std::abs(p2.x - p1.x) + std::abs(p2.y - p1.y);
     }
 
-    // Optimized connection check
-    bool canConnect(const Point& p1, const Point& p2, int& turns) {
-        // Direct line check
-        if (p1.x == p2.x || p1.y == p2.y) {
-            if (checkStraightLine(p1, p2)) {
-                turns = 0;
-                return true;
-            }
-            return false;
+    // ---------- 连接判定 ----------
+    bool canConnect(const Point& p1, const Point& p2, int& turns) const {
+        // 同行/同列且直线畅通：0 拐点。被挡时继续尝试一/两拐点绕行。
+        if ((p1.x == p2.x || p1.y == p2.y) && checkStraightLine(p1, p2)) {
+            turns = 0;
+            return true;
         }
-
-        // One turn check
         if (checkOneTurn(p1, p2)) {
             turns = 1;
             return true;
         }
-
-        // Two turns check
         if (checkTwoTurns(p1, p2)) {
             turns = 2;
             return true;
         }
-
         return false;
     }
 
-    bool checkStraightLine(const Point& p1, const Point& p2) {
-        int minX = std::min<int>(p1.x, p2.x);
-        int maxX = std::max<int>(p1.x, p2.x);
-        int minY = std::min<int>(p1.y, p2.y);
-        int maxY = std::max<int>(p1.y, p2.y);
-
-        // Check horizontal line
+    // 两点必须共行或共列；检查其间的所有格是否全空
+    bool checkStraightLine(const Point& p1, const Point& p2) const {
         if (p1.y == p2.y) {
-            for (int x = minX + 1; x < maxX; x++) {
-                if (!gameBoard.isEmpty(p1.y, x)) return false;
+            int lo = std::min(p1.x, p2.x), hi = std::max(p1.x, p2.x);
+            for (int x = lo + 1; x < hi; ++x) {
+                if (!isEmpty(p1.y, x)) return false;
             }
             return true;
         }
-
-        // Check vertical line
         if (p1.x == p2.x) {
-            for (int y = minY + 1; y < maxY; y++) {
-                if (!gameBoard.isEmpty(y, p1.x)) return false;
+            int lo = std::min(p1.y, p2.y), hi = std::max(p1.y, p2.y);
+            for (int y = lo + 1; y < hi; ++y) {
+                if (!isEmpty(y, p1.x)) return false;
             }
             return true;
         }
-
         return false;
     }
 
-    bool checkOneTurn(const Point& p1, const Point& p2) {
-        // Check turn at (p1.x, p2.y)
-        if (gameBoard.isEmpty(p2.y, p1.x) &&
-            checkStraightLine(p1, Point(p1.x, p2.y)) &&
-            checkStraightLine(Point(p1.x, p2.y), p2)) {
+    // 一个拐点：拐角落在两点行列交点（恒在棋盘内）
+    bool checkOneTurn(const Point& p1, const Point& p2) const {
+        Point corner1(p1.x, p2.y);
+        if (isEmpty(corner1.y, corner1.x) &&
+            checkStraightLine(p1, corner1) && checkStraightLine(corner1, p2)) {
             return true;
         }
-
-        // Check turn at (p2.x, p1.y)
-        if (gameBoard.isEmpty(p1.y, p2.x) &&
-            checkStraightLine(p1, Point(p2.x, p1.y)) &&
-            checkStraightLine(Point(p2.x, p1.y), p2)) {
+        Point corner2(p2.x, p1.y);
+        if (isEmpty(corner2.y, corner2.x) &&
+            checkStraightLine(p1, corner2) && checkStraightLine(corner2, p2)) {
             return true;
         }
-
         return false;
     }
 
-    bool checkTwoTurns(const Point& p1, const Point& p2) {
-        // Check all possible middle points
-        for (int x = 0; x < NUM_COLS; x++) {
-            if (x != p1.x && x != p2.x &&
-                gameBoard.isEmpty(p1.y, x) && gameBoard.isEmpty(p2.y, x) &&
-                checkStraightLine(p1, Point(x, p1.y)) &&
-                checkStraightLine(Point(x, p1.y), Point(x, p2.y)) &&
-                checkStraightLine(Point(x, p2.y), p2)) {
+    // 两个拐点：中间线可落在外框（下标 -1 与 COLS/ROWS）以支持绕框连接
+    bool checkTwoTurns(const Point& p1, const Point& p2) const {
+        // 竖直中间线（枚举列 x，含左右外框）
+        for (int x = -1; x <= COLS; ++x) {
+            if (x == p1.x || x == p2.x) continue;
+            Point c1(x, p1.y), c2(x, p2.y);
+            if (isEmpty(c1.y, c1.x) && isEmpty(c2.y, c2.x) &&
+                checkStraightLine(p1, c1) && checkStraightLine(c1, c2) &&
+                checkStraightLine(c2, p2)) {
                 return true;
             }
         }
-
-        for (int y = 0; y < COLUMN_COUNT; y++) {
-            if (y != p1.y && y != p2.y &&
-                gameBoard.isEmpty(y, p1.x) && gameBoard.isEmpty(y, p2.x) &&
-                checkStraightLine(p1, Point(p1.x, y)) &&
-                checkStraightLine(Point(p1.x, y), Point(p2.x, y)) &&
-                checkStraightLine(Point(p2.x, y), p2)) {
+        // 水平中间线（枚举行 y，含上下外框）
+        for (int y = -1; y <= ROWS; ++y) {
+            if (y == p1.y || y == p2.y) continue;
+            Point c1(p1.x, y), c2(p2.x, y);
+            if (isEmpty(c1.y, c1.x) && isEmpty(c2.y, c2.x) &&
+                checkStraightLine(p1, c1) && checkStraightLine(c1, c2) &&
+                checkStraightLine(c2, p2)) {
                 return true;
             }
         }
-
         return false;
     }
 
-    // Read blocks from process memory
-    bool readBlocksFromProcessMemory() {
-        if (processHandle == nullptr) {
-            std::cout << "Cannot get process handle" << std::endl;
-            return false;
+    // ---------- 消除（点击）----------
+    // 本轮所有方块对基于同一快照且互不重叠；消除只会把格子变空，
+    // 只会“打开”而非“堵住”其它对的路径，故整批点击是安全的。
+    void eliminatePairs() {
+        if (!IsWindow(windowHandle_)) return;
+        SetForegroundWindow(windowHandle_);
+        SetWindowPos(windowHandle_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE);
+        for (const auto& pair : pairs_) {
+            click(pair.first.point.x, pair.first.point.y);
+            click(pair.second.point.x, pair.second.point.y);
         }
-        blocks_.clear();
-        // Use smart pointer to manage memory
-        size_t regionSize = END_ADDRESS - START_ADDRESS + 1;
-        std::unique_ptr<unsigned char[]> buffer(new unsigned char[regionSize]);
-
-        // Read memory
-        SIZE_T bytesRead;
-        if (!ReadProcessMemory(processHandle,
-            reinterpret_cast<LPCVOID>(START_ADDRESS), buffer.get(),
-            regionSize, &bytesRead)) {
-            return false;
-        }
-
-        // Process memory data
-        for (int row = 0; row < COLUMN_COUNT; ++row) {
-            for (int col = 0; col < NUM_COLS; ++col) {
-                int index = row * NUM_COLS + col;
-                unsigned char value = buffer[index];
-                if (value != 0) {
-                    Block block;
-                    block.value = value;
-                    block.point.x = col;
-                    block.point.y = row;
-                    blocks_.emplace_back(block);
-                }
-            }
-        }
-        return true;
     }
 
-    void click(int index_x, int index_y) {
-        // Get process window position info
+    void click(int col, int row) const {
         RECT rect;
-        GetWindowRect(windowHandle, &rect);
-        int windowWidth = rect.right - rect.left;
-        int windowHeight = rect.bottom - rect.top;
+        if (!IsWindow(windowHandle_) || !GetWindowRect(windowHandle_, &rect)) return;
 
-        // Calculate window center coordinates
-        int topleft_x = rect.left + 25;
-        int topleft_y = rect.top + 195;
+        int px = rect.left + CLICK_ORIGIN_X + col * CELL_W;
+        int py = rect.top + CLICK_ORIGIN_Y + row * CELL_H;
 
-        // Move mouse to process window center coordinates
-        topleft_x += (index_x * 31);
-        topleft_y += (index_y * 35);
-
-        SetCursorPos(topleft_x, topleft_y); // Set mouse position
-
-        // Simulate mouse left button press and release
+        SetCursorPos(px, py);
         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        if (CLICK_GAP_MS) Sleep(CLICK_GAP_MS);
     }
 
-    void eiminationBox() {
-        SetWindowPos(windowHandle, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE); // Set window to top layer
-
-        for (auto& x : blockspair_) {
-            click(x.first.point.x, x.first.point.y);  // Click first block
-            click(x.second.point.x, x.second.point.y); // Click second block
-            // Sleep(1); // Optional: Add delay between clicks
-        }
-    }
-
-    // Check key press state
-    bool isKeyPressed(int key) const {
+    static bool isKeyPressed(int key) {
         return (GetAsyncKeyState(key) & 0x8000) != 0;
     }
-
-private:
-    static constexpr int COLUMN_COUNT = 11;
-    static constexpr int NUM_COLS = 19;
-    static constexpr uintptr_t START_ADDRESS = 0x199F5C + 4;
-    static constexpr uintptr_t END_ADDRESS = 0x19A02C + 4;
-
-    std::vector<Block> blocks_;
-    std::vector<std::pair<Block, Block>> blockspair_;
-    HANDLE processHandle = nullptr;
-    HWND windowHandle = nullptr;
-    bool isRunning = false;
 };
 
 int main() {
+    SetConsoleOutputCP(CP_UTF8);  // 让中文控制台输出正确显示
     Link link;
-    std::cout << "F1 ��ʼ\nF2 ֹͣ" << std::endl;
     link.run();
     return 0;
 }
