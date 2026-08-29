@@ -50,7 +50,7 @@ public:
     void run() {
         std::cout << "F1 开始\nF2 停止" << std::endl;
         while (true) {
-            handleKeyInput();
+            handleKeyInput(); // 检测按键F2，开启或者停止
             if (!isRunning_) {
                 Sleep(100);
                 continue;
@@ -114,6 +114,9 @@ private:
         }
     }
 
+    /**
+     * 初始化 ，主要是拿到游戏进程句柄
+     */
     bool initializeGame() {
         if (!readWindow()) {
             std::cout << "未找到目标进程" << std::endl;
@@ -174,13 +177,18 @@ private:
         }
     }
 
+    /**
+     * 获取连连看进程的句柄
+     */
     bool readWindow() {
+        // 通过查询窗口标题来确认游戏是否运行，获取窗口句柄
         windowHandle_ = FindWindowW(nullptr, L"QQ游戏 - 连连看角色版");
         if (!windowHandle_) {
             std::cout << "未找到目标窗口" << std::endl;
             return false;
         }
-
+        
+        // 通过句柄获取线程ID
         DWORD processId = 0;
         if (GetWindowThreadProcessId(windowHandle_, &processId) == 0 || processId == 0) {
             std::cout << "无法获取窗口进程 ID" << std::endl;
@@ -188,6 +196,7 @@ private:
         }
 
         closeProcess();  // 关闭上一轮的句柄，避免泄漏
+        // 打开进程 todo 作用是啥？
         processHandle_ = OpenProcess(PROCESS_VM_READ, FALSE, processId);
         if (!processHandle_) {
             DWORD err = GetLastError();
@@ -207,6 +216,7 @@ private:
 
         std::array<unsigned char, REGION_SIZE> buffer{};
         SIZE_T bytesRead = 0;
+        // 从指定的内存地址读取连连看的数据
         if (!ReadProcessMemory(processHandle_,
                                reinterpret_cast<LPCVOID>(START_ADDRESS),
                                buffer.data(), REGION_SIZE, &bytesRead) ||
@@ -216,13 +226,17 @@ private:
 
         // 每轮都从内存重建栅格与分组（写入 0 以清除已消除的格子）
         for (auto& row : grid_) row.fill(0);
-        valueGroups_.clear();
+        valueGroups_.clear(); // todo 作用
 
         for (int y = 0; y < ROWS; ++y) {
             for (int x = 0; x < COLS; ++x) {
+                // 从指定的内存地址，读取每一个方格的属性
                 unsigned char value = buffer[static_cast<size_t>(y) * COLS + x];
+                // 将属性设置到方格中
                 setCell(y, x, value);
                 if (value != 0) {
+                    // 这里的作用大概是记录每一个属性的坐标，方便后续快速寻找并消
+                    // 将所有相同的属性值的坐标全部放在一个数组中
                     valueGroups_[value].emplace_back(x, y);
                 }
             }
@@ -235,8 +249,8 @@ private:
 
     // 允许查询 [-1, ROWS] × [-1, COLS]（含外框一圈）；范围外视为非空
     bool isEmpty(int y, int x) const {
-        if (y < -1 || y > ROWS || x < -1 || x > COLS) return false;
-        return grid_[y + 1][x + 1] == 0;
+        if (y < -1 || y > ROWS || x < -1 || x > COLS) return false; // 防御性编程，没有越界
+        return grid_[y + 1][x + 1] == 0; // 确认指定的坐标点没有被填满属性
     }
 
     // ---------- 匹配算法 ----------
@@ -248,20 +262,25 @@ private:
     }
 
     // 对同值方块做贪心匹配：优先拐点少、曼哈顿距离短的连接
+    /**
+     * value：连连看的属性值(代表是什么类型的牌)
+     * points: 该牌的位置坐标
+     */
     void matchGroup(unsigned char value, const std::vector<Point>& points) {
         std::vector<bool> matched(points.size(), false);
 
         for (size_t i = 0; i < points.size(); ++i) {
-            if (matched[i]) continue;
+            if (matched[i]) continue; // 如果是空的则跳过
 
             int bestIndex = -1;
             int bestTurns = 3;  // 合法连接最多 2 拐点，3 作哨兵
             int bestDistance = INT_MAX;
-
+            
+            // 这里是遍历所有非自身的节点
             for (size_t j = i + 1; j < points.size(); ++j) {
-                if (matched[j]) continue;
+                if (matched[j]) continue; // 如果为空则跳过
 
-                int turns = 0;
+                int turns = 0; // 记录有几个拐点
                 if (canConnect(points[i], points[j], turns)) {
                     int distance = manhattan(points[i], points[j]);
                     if (turns < bestTurns ||
@@ -288,6 +307,11 @@ private:
     }
 
     // ---------- 连接判定 ----------
+    /**
+     * p1: 原始点
+     * p2: 目标点
+     * turns：原点和目标点的拐点数，需要修改返回
+     */
     bool canConnect(const Point& p1, const Point& p2, int& turns) const {
         // 同行/同列且直线畅通：0 拐点。被挡时继续尝试一/两拐点绕行。
         if ((p1.x == p2.x || p1.y == p2.y) && checkStraightLine(p1, p2)) {
@@ -306,10 +330,14 @@ private:
     }
 
     // 两点必须共行或共列；检查其间的所有格是否全空
+    /*
+    这个函数就是在检测两个点是不是共线
+    函数签名末尾的 const 修饰的是隐式的 this 指针，表示这个成员函数不会修改对象的状态（即不会修改任何非 mutable 成员变量）。
+    */
     bool checkStraightLine(const Point& p1, const Point& p2) const {
         if (p1.y == p2.y) {
             int lo = std::min(p1.x, p2.x), hi = std::max(p1.x, p2.x);
-            for (int x = lo + 1; x < hi; ++x) {
+            for (int x = lo + 1; x < hi; ++x) { // 从最左边遍历到最右边
                 if (!isEmpty(p1.y, x)) return false;
             }
             return true;
@@ -392,6 +420,7 @@ private:
     }
 
     static bool isKeyPressed(int key) {
+        // 获取指定按键宏的状态，确认其是否已经按下
         return (GetAsyncKeyState(key) & 0x8000) != 0;
     }
 };
