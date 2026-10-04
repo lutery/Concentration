@@ -89,11 +89,11 @@ private:
 
     // 带一圈空白外框的占用栅格：真实格 (y,x) 存于 grid_[y+1][x+1]，
     // 外框（下标 0 与 ROWS+1 / COLS+1）恒为空，用于支持“绕外框一圈”的连接。
-    std::array<std::array<unsigned char, COLS + 2>, ROWS + 2> grid_{};
+    std::array<std::array<unsigned char, COLS + 2>, ROWS + 2> grid_{}; 
 
     // 按值分组的方块坐标，供匹配算法使用
     std::unordered_map<unsigned char, std::vector<Point>> valueGroups_;
-    std::vector<std::pair<Block, Block>> pairs_;
+    std::vector<std::pair<Block, Block>> pairs_; // 专门存储匹配点的坐标
 
     HANDLE processHandle_ = nullptr;
     HWND windowHandle_ = nullptr;
@@ -127,7 +127,7 @@ private:
 
     void runGameLoop() {
         while (isRunning_) {
-            if (isKeyPressed(VK_F2)) {
+            if (isKeyPressed(VK_F2)) { // 在游戏中按F2则暂停游戏
                 isRunning_ = false;
                 std::cout << "程序已暂停，按 F1 继续" << std::endl;
                 Sleep(200);
@@ -149,7 +149,7 @@ private:
                 continue;
             }
 
-            findMatchingPairs();
+            findMatchingPairs(); // 找到当前状态下的匹配点
 
             if (pairs_.empty()) {
                 // 有方块却找不到任何可连接对：可能是死局（需洗牌）。
@@ -196,7 +196,7 @@ private:
         }
 
         closeProcess();  // 关闭上一轮的句柄，避免泄漏
-        // 打开进程 todo 作用是啥？
+        // 打开进程，用于读取连连看内存数据
         processHandle_ = OpenProcess(PROCESS_VM_READ, FALSE, processId);
         if (!processHandle_) {
             DWORD err = GetLastError();
@@ -226,7 +226,7 @@ private:
 
         // 每轮都从内存重建栅格与分组（写入 0 以清除已消除的格子）
         for (auto& row : grid_) row.fill(0);
-        valueGroups_.clear(); // todo 作用
+        valueGroups_.clear(); // 用于后面按照属性，从里面提取所有的点，找到配对点
 
         for (int y = 0; y < ROWS; ++y) {
             for (int x = 0; x < COLS; ++x) {
@@ -234,7 +234,7 @@ private:
                 unsigned char value = buffer[static_cast<size_t>(y) * COLS + x];
                 // 将属性设置到方格中
                 setCell(y, x, value);
-                if (value != 0) {
+                if (value != 0) { // 表示这里有格子
                     // 这里的作用大概是记录每一个属性的坐标，方便后续快速寻找并消
                     // 将所有相同的属性值的坐标全部放在一个数组中
                     valueGroups_[value].emplace_back(x, y);
@@ -250,12 +250,15 @@ private:
     // 允许查询 [-1, ROWS] × [-1, COLS]（含外框一圈）；范围外视为非空
     bool isEmpty(int y, int x) const {
         if (y < -1 || y > ROWS || x < -1 || x > COLS) return false; // 防御性编程，没有越界
-        return grid_[y + 1][x + 1] == 0; // 确认指定的坐标点没有被填满属性
+        return grid_[y + 1][x + 1] == 0; // 确认指定的坐标点没有被填满属性，也就是没有牌挡住
     }
 
     // ---------- 匹配算法 ----------
     void findMatchingPairs() {
         pairs_.clear();
+        // 按照相同属性的牌遍历匹配点
+        // 但是这个应该不是一次性找到所有的匹配点，应该会循环遍历
+        // 因为有些牌一开始在内部被当着
         for (const auto& [value, points] : valueGroups_) {
             matchGroup(value, points);
         }
@@ -270,7 +273,7 @@ private:
         std::vector<bool> matched(points.size(), false);
 
         for (size_t i = 0; i < points.size(); ++i) {
-            if (matched[i]) continue; // 如果是空的则跳过
+            if (matched[i]) continue; // 如果目标点已经找到了匹配点，那么则直接遍历下一个点
 
             int bestIndex = -1;
             int bestTurns = 3;  // 合法连接最多 2 拐点，3 作哨兵
@@ -278,26 +281,28 @@ private:
             
             // 这里是遍历所有非自身的节点
             for (size_t j = i + 1; j < points.size(); ++j) {
-                if (matched[j]) continue; // 如果为空则跳过
+                if (matched[j]) continue; // 如果目标点已经找到了匹配点，那么则直接遍历下一个点
 
                 int turns = 0; // 记录有几个拐点
-                if (canConnect(points[i], points[j], turns)) {
-                    int distance = manhattan(points[i], points[j]);
+                if (canConnect(points[i], points[j], turns)) { // 判断两个点之间是否可以连接
+                    int distance = manhattan(points[i], points[j]); // 获取两个点之间的距离
+                    // 拐点数小于合法值 或者 距离和拐点数最少的点
                     if (turns < bestTurns ||
                         (turns == bestTurns && distance < bestDistance)) {
-                        bestTurns = turns;
-                        bestDistance = distance;
-                        bestIndex = static_cast<int>(j);
+                        bestTurns = turns; // 记录拐点数
+                        bestDistance = distance; // 记录两者之间的距离
+                        bestIndex = static_cast<int>(j); // 记录最匹配的点的索引
                     }
                 }
             }
 
-            if (bestIndex != -1) {
+            if (bestIndex != -1) { // 找到最匹配的点的索引
+                // 构建配对点并存储到 pairs_
                 Block a(points[i].x, points[i].y, value);
                 Block b(points[bestIndex].x, points[bestIndex].y, value);
                 pairs_.emplace_back(a, b);
-                matched[i] = true;
-                matched[static_cast<size_t>(bestIndex)] = true;
+                matched[i] = true; // 记录索引i的点已经找到了匹配点，设置为true
+                matched[static_cast<size_t>(bestIndex)] = true; // 记录索引j的点已经找到了匹配点，设置为true
             }
         }
     }
@@ -311,6 +316,7 @@ private:
      * p1: 原始点
      * p2: 目标点
      * turns：原点和目标点的拐点数，需要修改返回
+     * 返回true表示可以连接，返回false表示无法链接
      */
     bool canConnect(const Point& p1, const Point& p2, int& turns) const {
         // 同行/同列且直线畅通：0 拐点。被挡时继续尝试一/两拐点绕行。
@@ -318,10 +324,14 @@ private:
             turns = 0;
             return true;
         }
+
+        // 一个拐点链接检测
         if (checkOneTurn(p1, p2)) {
             turns = 1;
             return true;
         }
+
+        // 两个拐点链接检测
         if (checkTwoTurns(p1, p2)) {
             turns = 2;
             return true;
@@ -333,16 +343,18 @@ private:
     /*
     这个函数就是在检测两个点是不是共线
     函数签名末尾的 const 修饰的是隐式的 this 指针，表示这个成员函数不会修改对象的状态（即不会修改任何非 mutable 成员变量）。
+
+    返回true表示两个点之间共线且中间没有任何东西挡住
     */
     bool checkStraightLine(const Point& p1, const Point& p2) const {
-        if (p1.y == p2.y) {
+        if (p1.y == p2.y) { // 同高度检测共线
             int lo = std::min(p1.x, p2.x), hi = std::max(p1.x, p2.x);
             for (int x = lo + 1; x < hi; ++x) { // 从最左边遍历到最右边
                 if (!isEmpty(p1.y, x)) return false;
             }
             return true;
         }
-        if (p1.x == p2.x) {
+        if (p1.x == p2.x) { // 同水平线检测共线
             int lo = std::min(p1.y, p2.y), hi = std::max(p1.y, p2.y);
             for (int y = lo + 1; y < hi; ++y) {
                 if (!isEmpty(y, p1.x)) return false;
@@ -353,8 +365,11 @@ private:
     }
 
     // 一个拐点：拐角落在两点行列交点（恒在棋盘内）
+    // 对于连连看游戏，如果只有一个拐点，拐点的横纵坐标肯定一个是p1点一个是p2点
     bool checkOneTurn(const Point& p1, const Point& p2) const {
         Point corner1(p1.x, p2.y);
+        // 第一个判断确保拐点处没牌
+        // 第二个判断确保拐点和另外两个牌共线且没遮挡
         if (isEmpty(corner1.y, corner1.x) &&
             checkStraightLine(p1, corner1) && checkStraightLine(corner1, p2)) {
             return true;
@@ -370,16 +385,20 @@ private:
     // 两个拐点：中间线可落在外框（下标 -1 与 COLS/ROWS）以支持绕框连接
     bool checkTwoTurns(const Point& p1, const Point& p2) const {
         // 竖直中间线（枚举列 x，含左右外框）
-        for (int x = -1; x <= COLS; ++x) {
-            if (x == p1.x || x == p2.x) continue;
-            Point c1(x, p1.y), c2(x, p2.y);
+        for (int x = -1; x <= COLS; ++x) { // 水平遍历左右可能的拐点坐标
+            if (x == p1.x || x == p2.x) continue; // 如果竖线在p1或者p2则跳过，毕竟是2个拐点，不可能有这种情况
+            Point c1(x, p1.y), c2(x, p2.y); // 构建当前水平坐标的两个拐点，
+            // 其中一个拐点肯定和一个原点的众坐标相同
+
+            // 判断两个拐点处没有牌
+            // 判断拐点与拐点、拐点和p1点，拐点和p2点之间是否直连
             if (isEmpty(c1.y, c1.x) && isEmpty(c2.y, c2.x) &&
                 checkStraightLine(p1, c1) && checkStraightLine(c1, c2) &&
                 checkStraightLine(c2, p2)) {
                 return true;
             }
         }
-        // 水平中间线（枚举行 y，含上下外框）
+        // 水平中间线（枚举行 y，含上下外框）流程同上
         for (int y = -1; y <= ROWS; ++y) {
             if (y == p1.y || y == p2.y) continue;
             Point c1(p1.x, y), c2(p2.x, y);
